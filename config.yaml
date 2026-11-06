@@ -1,0 +1,7 @@
+name: "Somfy TaHoma (local)"
+packageKey: "somfy-tahoma-local"
+description: "Somfy shades, screens, awnings and shutters through the local API of a TaHoma box in Developer Mode"
+vendorSupportInformation: "https://github.com/Stoeckie"
+permissions:
+  lan: {}
+  discovery: {}

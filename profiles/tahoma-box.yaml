@@ -1,0 +1,37 @@
+name: tahoma-box
+components:
+  - id: main
+    capabilities:
+      - id: silvervalley08660.connectionStatus
+        version: 1
+      - id: silvervalley08660.connectionLog
+        version: 1
+      - id: refresh
+        version: 1
+    categories:
+      - name: Bridges
+preferences:
+  - name: token
+    title: Developer Mode token
+    description: "TaHoma by Somfy app: Account > Configure the installation > parameters of the box, tap 7 times on the PIN, then create a token in Developer Mode."
+    required: false
+    preferenceType: string
+    definition:
+      stringType: password
+      default: ""
+  - name: ipAddress
+    title: Box IP address
+    description: Leave on "auto" (found via mDNS). Set an IP only if that fails.
+    required: false
+    preferenceType: string
+    definition:
+      stringType: text
+      default: "auto"
+  - name: pollInterval
+    title: Poll interval (seconds)
+    required: false
+    preferenceType: integer
+    definition:
+      minimum: 10
+      maximum: 600
+      default: 30
