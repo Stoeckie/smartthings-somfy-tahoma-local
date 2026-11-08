@@ -6,8 +6,9 @@ local capabilities = require "st.capabilities"
 local log = require "log"
 local api = require "tahoma_api"
 local model = require "tahoma_model"
+local emitq = require "emitq"  -- only changed values go to the hub (see emitq.lua)
 
-local BUILD = "2026-11-08b"
+local BUILD = "2026-11-09a"
 local FAST_POLL_SECS = 2
 local FAST_POLL_FOR = 60
 
@@ -108,22 +109,20 @@ local function emit_shade(child, sd, kind)
   if sd.available == false then child:offline() return end
   child:online()
   local lvl = model.level(sd, kind, invert)
-  pcall(function()
-    child:emit_event(shade.supportedWindowShadeCommands({ "open", "close", "pause" }, { visibility = { displayed = false } }))
-  end)
+  emitq.try(child, shade.supportedWindowShadeCommands({ "open", "close", "pause" }, { visibility = { displayed = false } }))
   if lvl ~= nil then
-    pcall(function() child:emit_event(shadeLevel.shadeLevel(lvl)) end)
+    emitq.try(child, shadeLevel.shadeLevel(lvl))
     local st = model.shade_state(lvl)
     if model.moving(sd) then
       local last = child:get_field("last_level")
       if last and lvl > last then st = "opening" elseif last and lvl < last then st = "closing" end
     end
-    pcall(function() child:emit_event(shade.windowShade(st)) end)
+    emitq.try(child, shade.windowShade(st))
     child:set_field("last_level", lvl)
   else
     -- RTS: no position, show the last command
     local last = child:get_field("rts_state") or "unknown"
-    pcall(function() child:emit_event(shade.windowShade(last)) end)
+    emitq.try(child, shade.windowShade(last))
   end
 end
 
@@ -238,6 +237,14 @@ local function send(driver, child, action, value)
     return
   end
   local invert = (child.preferences or {}).invert == true
+  -- the app sends the shown value again when a slider or list is opened and closed without a change: a position
+  -- the shade already has (and it is not moving) is not sent, so no exec call and no fast polling for nothing
+  local target = (action == "open" and 100) or (action == "close" and 0) or (action == "level" and tonumber(value)) or nil
+  local cur = model.level(s.dev, s.kind, invert)
+  if target and cur and cur == math.floor(target + 0.5) and not model.moving(s.dev) then
+    log.info(string.format("[tahoma] %s: already at %d%%, nothing sent", child.label, cur))
+    return
+  end
   local cmds = model.commands(s.dev, s.kind, action, value, invert)
   if not cmds then
     log.warn("[tahoma] " .. child.label .. ": no command for " .. action)
@@ -254,7 +261,7 @@ local function send(driver, child, action, value)
     local rts = (action == "open" or (action == "level" and (tonumber(value) or 0) >= 50)) and "open"
       or ((action == "close" or action == "level") and "closed") or "partially open"
     child:set_field("rts_state", rts, { persist = true })
-    pcall(function() child:emit_event(shade.windowShade(rts)) end)
+    emitq.try(child, shade.windowShade(rts))
   end
   fast_poll(driver, box)
 end
@@ -290,6 +297,7 @@ local function info_changed(driver, device, _event, args)
 end
 
 local function device_removed(_driver, device)
+  emitq.forget(device)
   local st = state[device.id]
   if st and st.timer then pcall(function() device.thread:cancel_timer(st.timer) end) end
   state[device.id] = nil
