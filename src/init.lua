@@ -7,7 +7,7 @@ local log = require "log"
 local api = require "tahoma_api"
 local model = require "tahoma_model"
 
-local BUILD = "2026-11-06b"
+local BUILD = "2026-11-08a"
 local FAST_POLL_SECS = 2
 local FAST_POLL_FOR = 60
 
@@ -28,6 +28,14 @@ end
 local function set_conn(dev, up, reason)
   if up then
     dev:set_field("conn_down_since", nil)
+    if not dev:get_field("drop_seen") then
+      -- the app wants a value for every attribute ("not all status information updated yet" otherwise)
+      dev:set_field("drop_seen", true)
+      local ok, v = pcall(dev.get_latest_state, dev, "main", drop_cap.ID, "lastDrop")
+      if ok and v == nil and not dev:get_field("conn_drop") then
+        pcall(function() dev:emit_event(drop_cap.lastDrop("No drops yet")) end)
+      end
+    end
     local d = dev:get_field("conn_drop")
     if type(d) == "table" and d.at then
       dev:set_field("conn_drop", nil, { persist = true })
