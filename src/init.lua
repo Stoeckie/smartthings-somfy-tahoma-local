@@ -7,14 +7,20 @@ local log = require "log"
 local api = require "tahoma_api"
 local model = require "tahoma_model"
 
-local BUILD = "2026-11-08a"
+local BUILD = "2026-11-08b"
 local FAST_POLL_SECS = 2
 local FAST_POLL_FOR = 60
 
 -- Connection status as a capability, so routines can notify when the box is unreachable.
 local conn_cap = capabilities["silvervalley08660.connectionStatus"]
 local drop_cap = capabilities["silvervalley08660.connectionLog"]
-local CONN_GRACE = 120
+local CONN_GRACE = 300
+local function conn_grace(dev)
+  -- setting "Offline after (minutes)": a router or network update at night takes a few minutes
+  local m = tonumber(dev.preferences and dev.preferences.offlineAfter)
+  if m and m >= 1 then return math.floor(m * 60) end
+  return CONN_GRACE
+end
 local function emit_conn(dev, v)
   if dev:get_field("conn_status") == v then return end
   local ok = pcall(function() dev:emit_event(conn_cap.status(v)) end)
@@ -53,7 +59,7 @@ local function set_conn(dev, up, reason)
   local since = os.time()
   dev:set_field("conn_down_since", since)
   local ok = pcall(function()
-    dev.thread:call_with_delay(CONN_GRACE, function()
+    dev.thread:call_with_delay(conn_grace(dev), function()
       if dev:get_field("conn_down_since") == since then emit_conn(dev, "offline") end
     end)
   end)

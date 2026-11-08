@@ -11,6 +11,15 @@ components:
     categories:
       - name: Bridges
 preferences:
+  - name: offlineAfter
+    title: Offline after (minutes)
+    description: "Connection only turns Offline after this many minutes without contact, so a short network outage (e.g. a router update at night) gives no notification."
+    required: false
+    preferenceType: integer
+    definition:
+      minimum: 1
+      maximum: 120
+      default: 5
   - name: token
     title: Developer Mode token
     description: "TaHoma by Somfy app: Account > Configure the installation > parameters of the box, tap 7 times on the PIN, then create a token in Developer Mode."
