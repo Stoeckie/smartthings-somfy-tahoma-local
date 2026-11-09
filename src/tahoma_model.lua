@@ -98,6 +98,11 @@ function M.exec_body(device_url, cmds)
   return { label = "SmartThings", actions = { { deviceURL = device_url, commands = cmds } } }
 end
 
+--- one execution for several shades: actions = { { deviceURL = .., commands = { .. } }, .. }
+function M.exec_body_many(actions)
+  return { label = "SmartThings", actions = actions }
+end
+
 --- the shades among the devices of GET /setup/devices
 function M.shades(devices)
   local out = {}

@@ -28,14 +28,20 @@ package.loaded["log"] = { info = function(m) LOGS[#LOGS + 1] = m end, warn = fun
                           error = function(m) LOGS[#LOGS + 1] = "E " .. m end, debug = function() end }
 package.loaded["cosock.socket"] = {}; package.loaded["cosock.ssl"] = {}
 CALLS = {}
+EXEC_Q = {}
+EXEC_FAIL = 0   -- number of /exec/apply calls that fail next
+-- run the delayed exec queue (gather window, retry) like the hub would
+function RUN_EXEC() while #EXEC_Q > 0 do table.remove(EXEC_Q, 1)() end end
 package.loaded["tahoma_api"] = { json = function(method, host, path, token, payload)
   CALLS[#CALLS + 1] = { method = method, host = host, path = path, token = token, payload = payload }
   if path == "/setup/devices" then return SOMFY end
+  if EXEC_FAIL > 0 then EXEC_FAIL = EXEC_FAIL - 1; return nil, "tls handshake failed" end
   return { execId = "x" } end }
 DEVICES = {}
 local function mkdev(o)
   o.fields = {}; o.events = {}; o.status = "online"
-  o.thread = { call_on_schedule = function() return 1 end, call_with_delay = function() end, cancel_timer = function() end }
+  o.thread = { call_on_schedule = function() return 1 end, call_with_delay = function(_, d, f, name)
+    if name == "tahoma-exec" then EXEC_Q[#EXEC_Q + 1] = f end end, cancel_timer = function() end }
   function o:get_field(k) return self.fields[k] end
   function o:set_field(k, v) self.fields[k] = v end
   function o:emit_event(e) self.events[e.path] = e.arg; self.n = (self.n or 0) + 1; if e.state_change then self.forced = (self.forced or 0) + 1 end end
@@ -93,10 +99,10 @@ def test_flow():
     keuken = lua.eval('(function() for _, d in ipairs(DEVICES) do if d.label == "Kitchen" then return d end end end)()')
     assert over.events[b"cap.windowShadeLevel.shadeLevel"] == 0 and over.events[b"cap.windowShade.windowShade"] == b"closed"
     assert keuken.events[b"cap.windowShadeLevel.shadeLevel"] == 100 and keuken.events[b"cap.windowShade.windowShade"] == b"open"
-    # only changed values go to the hub: another poll with the same states emits nothing; the first emits carried
-    # state_change so the cloud catches up after a driver start
+    # only changed values go to the hub: another poll with the same states emits nothing; the first emits are not
+    # forced (state_change would run routines again after every driver update)
     n0, forced = over.n, over.forced
-    assert forced == n0 and n0 >= 3
+    assert forced is None and n0 >= 3
     lua.execute(b'DRIVER.capability_handlers.refresh.refresh(DRIVER_OBJ, BOX)')
     assert over.n == n0
     # a position the shade already has is not sent (the app re-sends the shown value when a slider is opened)
@@ -108,11 +114,13 @@ def test_flow():
     # commands
     lua.globals().OVER = over
     lua.execute(b'DRIVER.capability_handlers.windowShadeLevel.setShadeLevel(DRIVER_OBJ, OVER, { args = { shadeLevel = 40 } })')
+    assert len(g.CALLS) == calls0   # gathered first
+    lua.execute(b'RUN_EXEC()')
     last = g.CALLS[len(g.CALLS)]
     out = json.loads(j.encode(last.payload))
     assert last.method == b"POST" and last.path == b"/exec/apply"
     assert out["actions"][0] == {"deviceURL": "io://1111-2222-3333/101", "commands": [{"name": "setClosure", "parameters": [60]}]}
-    lua.execute(b'DRIVER.capability_handlers.windowShadePreset.presetPosition(DRIVER_OBJ, OVER, {})')
+    lua.execute(b'DRIVER.capability_handlers.windowShadePreset.presetPosition(DRIVER_OBJ, OVER, {}); RUN_EXEC()')
     out = json.loads(j.encode(g.CALLS[len(g.CALLS)].payload))
     assert out["actions"][0]["commands"] == [{"name": "my"}]
 
@@ -122,3 +130,55 @@ def test_no_token():
       DRIVER_OBJ = { get_devices = function() return DEVICES end, try_create_device = function(_, o) DRIVER_OBJ_TRY(o) end }
       DRIVER.capability_handlers.refresh.refresh(DRIVER_OBJ, BOX)''')
     assert len(lua.globals().CALLS) == 0
+
+
+def ready():
+    """setup + children created + states emitted; returns lua, json, Landing, Kitchen"""
+    lua, j = setup()
+    lua.execute(b'''DRIVER_OBJ = { get_devices = function() return DEVICES end, try_create_device = function(_, o) DRIVER_OBJ_TRY(o) end }
+      DRIVER.capability_handlers.refresh.refresh(DRIVER_OBJ, BOX)
+      DRIVER.capability_handlers.refresh.refresh(DRIVER_OBJ, BOX)
+      for _, d in ipairs(DEVICES) do if d.label == "Landing" then OVER = d elseif d.label == "Kitchen" then KEUKEN = d end end''')
+    g = lua.globals()
+    return lua, j, g
+
+
+def test_one_exec_for_all_shades():
+    """A routine closing all shades: one /exec/apply with all actions, not one TLS session per shade."""
+    lua, j, g = ready()
+    calls0 = len(g.CALLS)
+    lua.execute(b'''DRIVER.capability_handlers.windowShade.open(DRIVER_OBJ, OVER, {})
+      DRIVER.capability_handlers.windowShade.close(DRIVER_OBJ, KEUKEN, {})''')
+    assert len(g.CALLS) == calls0 and len(g.EXEC_Q) == 1
+    lua.execute(b'RUN_EXEC()')
+    assert len(g.CALLS) == calls0 + 1
+    out = json.loads(j.encode(g.CALLS[len(g.CALLS)].payload))
+    assert out["label"] == "SmartThings"
+    assert sorted(a["deviceURL"] for a in out["actions"]) == ["io://1111-2222-3333/101", "io://1111-2222-3333/102"]
+
+
+def test_exec_retry_then_force_real_state():
+    """A failed exec is retried once; when that fails too the real state goes out again (forced)."""
+    lua, j, g = ready()
+    calls0 = len(g.CALLS)
+    lua.execute(b'EXEC_FAIL = 1; DRIVER.capability_handlers.windowShade.open(DRIVER_OBJ, OVER, {}); RUN_EXEC()')
+    assert len(g.CALLS) == calls0 + 2   # failed, retried ok
+    assert g.OVER.forced is None
+    lua.execute(b'EXEC_FAIL = 2; DRIVER.capability_handlers.windowShade.open(DRIVER_OBJ, OVER, {}); RUN_EXEC()')
+    assert len(g.CALLS) == calls0 + 4
+    assert g.OVER.forced == 2   # shadeLevel and windowShade, forced
+    assert g.OVER.events[b"cap.windowShade.windowShade"] == b"closed"
+    assert any(b"E [tahoma] Landing open: tls" in (m or b"") for m in g.LOGS.values())
+
+
+def test_already_there_only_with_fresh_data():
+    """The 'already at X%' skip is only used when the last ok poll is less than 5 s old."""
+    lua, j, g = ready()
+    calls0 = len(g.CALLS)
+    lua.execute(b'DRIVER.capability_handlers.windowShade.close(DRIVER_OBJ, OVER, {}); RUN_EXEC()')
+    assert len(g.CALLS) == calls0   # fresh: skipped
+    # the data is 30 s old: the shade may have moved since, so the command goes out
+    lua.execute(b'OT = os.time; os.time = function(...) return OT(...) + 30 end')
+    lua.execute(b'DRIVER.capability_handlers.windowShade.close(DRIVER_OBJ, OVER, {}); RUN_EXEC()')
+    lua.execute(b'os.time = OT')
+    assert g.CALLS[len(g.CALLS)].path == b"/exec/apply"

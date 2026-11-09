@@ -8,9 +8,13 @@ local api = require "tahoma_api"
 local model = require "tahoma_model"
 local emitq = require "emitq"  -- only changed values go to the hub (see emitq.lua)
 
-local BUILD = "2026-11-09b"
+local BUILD = "2026-11-09c"
 local FAST_POLL_SECS = 2
 local FAST_POLL_FOR = 60
+-- commands of all shades within this window go to the box as one execution (a routine "close all")
+local EXEC_GATHER_SECS = 0.3
+-- the "already at X%" skip only trusts box data younger than this
+local FRESH_SECS = 5
 
 -- Connection status as a capability, so routines can notify when the box is unreachable.
 local conn_cap = capabilities["silvervalley08660.connectionStatus"]
@@ -104,25 +108,26 @@ end
 
 local function profile_for(kind) return kind == "rts" and "tahoma-shade-rts" or "tahoma-shade" end
 
-local function emit_shade(child, sd, kind)
+-- force: send level and state again with state_change (a failed command: the tile stops spinning)
+local function emit_shade(child, sd, kind, force)
   local invert = (child.preferences or {}).invert == true
   if sd.available == false then child:offline() return end
   child:online()
   local lvl = model.level(sd, kind, invert)
   emitq.try(child, shade.supportedWindowShadeCommands({ "open", "close", "pause" }, { visibility = { displayed = false } }))
   if lvl ~= nil then
-    emitq.try(child, shadeLevel.shadeLevel(lvl))
+    emitq.try(child, shadeLevel.shadeLevel(lvl), nil, force)
     local st = model.shade_state(lvl)
     if model.moving(sd) then
       local last = child:get_field("last_level")
       if last and lvl > last then st = "opening" elseif last and lvl < last then st = "closing" end
     end
-    emitq.try(child, shade.windowShade(st))
+    emitq.try(child, shade.windowShade(st), nil, force)
     child:set_field("last_level", lvl)
   else
     -- RTS: no position, show the last command
     local last = child:get_field("rts_state") or "unknown"
-    emitq.try(child, shade.windowShade(last))
+    emitq.try(child, shade.windowShade(last), nil, force)
   end
 end
 
@@ -227,6 +232,51 @@ local function schedule(driver, box)
   box.thread:call_with_delay(2, function() poll(driver, box) end)
 end
 
+-- Commands go through a queue per box: everything that arrives within EXEC_GATHER_SECS is sent as ONE
+-- /exec/apply with all actions (a routine closing all shades made one TLS session per shade, in parallel with
+-- the poll, and a failure was only logged). Runs on the box thread, so it does not overlap the box poll.
+local function exec_done(driver, box, batch, ok, err)
+  for _, q in ipairs(batch) do
+    local child, s = q.child, q.s
+    if ok then
+      log.info(string.format("[tahoma] %s: %s %s", child.label, q.cmds[1].name, table.concat(q.cmds[1].parameters or {}, ",")))
+      if s.kind == "rts" then
+        -- RTS reports no position: show the command optimistically
+        local rts = (q.action == "open" or (q.action == "level" and (tonumber(q.value) or 0) >= 50)) and "open"
+          or ((q.action == "close" or q.action == "level") and "closed") or "partially open"
+        child:set_field("rts_state", rts, { persist = true })
+        emitq.try(child, shade.windowShade(rts))
+      end
+    else
+      log.error("[tahoma] " .. child.label .. " " .. q.action .. ": " .. tostring(err))
+      -- show the real (last known) state again, forced, so the app does not keep waiting for the change
+      local st = state[box.id]
+      local cur = (st and st.devices or {})[child.parent_assigned_child_key] or s
+      pcall(emit_shade, child, cur.dev, cur.kind, true)
+    end
+  end
+  if ok then fast_poll(driver, box) end
+end
+
+local function exec_flush(driver, box)
+  local st = state[box.id]
+  if not st then return end
+  local batch = st.queue or {}
+  st.queue, st.queue_timer = nil, nil
+  if #batch == 0 then return end
+  local actions = {}
+  for _, q in ipairs(batch) do actions[#actions + 1] = { deviceURL = q.s.dev.deviceURL, commands = q.cmds } end
+  local body = model.exec_body_many(actions)
+  local host, token = settings(box)
+  local res, err = api.json("POST", host, "/exec/apply", token, body)
+  if res then exec_done(driver, box, batch, true); return end
+  log.warn(string.format("[tahoma] exec of %d action(s) failed (%s), retrying once", #batch, tostring(err)))
+  box.thread:call_with_delay(1, function()
+    local res2, err2 = api.json("POST", host, "/exec/apply", token, body)
+    exec_done(driver, box, batch, res2 ~= nil, err2)
+  end, "tahoma-exec")
+end
+
 local function send(driver, child, action, value)
   local box = child:get_parent_device()
   local st = box and state[box.id]
@@ -238,10 +288,12 @@ local function send(driver, child, action, value)
   end
   local invert = (child.preferences or {}).invert == true
   -- the app sends the shown value again when a slider or list is opened and closed without a change: a position
-  -- the shade already has (and it is not moving) is not sent, so no exec call and no fast polling for nothing
+  -- the shade already has (and it is not moving) is not sent, so no exec call and no fast polling for nothing.
+  -- Only with fresh box data: st.devices can be a whole poll interval old (the shade may have moved since).
   local target = (action == "open" and 100) or (action == "close" and 0) or (action == "level" and tonumber(value)) or nil
   local cur = model.level(s.dev, s.kind, invert)
-  if target and cur and cur == math.floor(target + 0.5) and not model.moving(s.dev) then
+  local fresh = st.last_ok and os.time() - st.last_ok < FRESH_SECS
+  if fresh and target and cur and cur == math.floor(target + 0.5) and not model.moving(s.dev) then
     log.info(string.format("[tahoma] %s: already at %d%%, nothing sent", child.label, cur))
     return
   end
@@ -250,20 +302,15 @@ local function send(driver, child, action, value)
     log.warn("[tahoma] " .. child.label .. ": no command for " .. action)
     return
   end
-  local host, token = settings(box)
-  local res, err = api.json("POST", host, "/exec/apply", token, model.exec_body(s.dev.deviceURL, cmds))
-  if not res then
-    log.error("[tahoma] " .. child.label .. " " .. action .. ": " .. tostring(err))
-    return
+  st.queue = st.queue or {}
+  -- a newer command for the same shade replaces the queued one (one action per device in an execution)
+  for i, q in ipairs(st.queue) do
+    if q.s.dev.deviceURL == s.dev.deviceURL then table.remove(st.queue, i); break end
   end
-  log.info(string.format("[tahoma] %s: %s %s", child.label, cmds[1].name, table.concat(cmds[1].parameters or {}, ",")))
-  if s.kind == "rts" then
-    local rts = (action == "open" or (action == "level" and (tonumber(value) or 0) >= 50)) and "open"
-      or ((action == "close" or action == "level") and "closed") or "partially open"
-    child:set_field("rts_state", rts, { persist = true })
-    emitq.try(child, shade.windowShade(rts))
+  st.queue[#st.queue + 1] = { child = child, s = s, action = action, value = value, cmds = cmds }
+  if not st.queue_timer then
+    st.queue_timer = box.thread:call_with_delay(EXEC_GATHER_SECS, function() exec_flush(driver, box) end, "tahoma-exec") or true
   end
-  fast_poll(driver, box)
 end
 
 local function handle_refresh(driver, device)
