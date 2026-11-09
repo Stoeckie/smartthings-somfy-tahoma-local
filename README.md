@@ -27,5 +27,7 @@ The token stays on your hub (device setting) and is only sent to the box. The bo
 * The Somfy Connectivity Kit and the first square TaHoma box have no Developer Mode.
 * Events: a value only goes to the hub when it changed (re-emitting everything every poll made the hub drop events, and the app then kept a stale position). After a driver start every value is sent once so the app catches up. A position the shade already has is not sent to the box (the app re-sends the shown value when a slider is opened and closed).
 
+**Security (build 2026-11-09b):** a pinned gateway certificate that cannot be read any more now stops the token from being sent (before, pinning was skipped).
+
 ## License
 Apache 2.0, see LICENSE. Not affiliated with Somfy.

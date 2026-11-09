@@ -8,7 +8,7 @@ local api = require "tahoma_api"
 local model = require "tahoma_model"
 local emitq = require "emitq"  -- only changed values go to the hub (see emitq.lua)
 
-local BUILD = "2026-11-09a"
+local BUILD = "2026-11-09b"
 local FAST_POLL_SECS = 2
 local FAST_POLL_FOR = 60
 
